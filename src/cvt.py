@@ -1,5 +1,6 @@
 from torch.hub import load_state_dict_from_url
 import torch.nn as nn
+
 from .utils.transformers import TransformerClassifier
 from .utils.tokenizer import Tokenizer
 from .utils.helpers import pe_check
@@ -82,7 +83,6 @@ def _cvt(arch, pretrained, progress,
             state_dict['classifier.positional_emb'] = model.state_dict()['classifier.positional_emb']
         model.load_state_dict(state_dict)
     return model
-
 
 def cvt_2(*args, **kwargs):
     return _cvt(num_layers=2, num_heads=2, mlp_ratio=1, embedding_dim=128,

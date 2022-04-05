@@ -168,7 +168,7 @@ class TransformerClassifier(Module):
             if positional_embedding == 'learnable':
                 self.positional_emb = Parameter(torch.zeros(1, sequence_length, embedding_dim),
                                                 requires_grad=True)
-                init.trunc_normal_(self.positional_emb, std=0.2)
+                init.normal_(self.positional_emb, std=0.2)
             else:
                 self.positional_emb = Parameter(self.sinusoidal_embedding(sequence_length, embedding_dim),
                                                 requires_grad=False)
@@ -215,7 +215,7 @@ class TransformerClassifier(Module):
     @staticmethod
     def init_weight(m):
         if isinstance(m, Linear):
-            init.trunc_normal_(m.weight, std=.02)
+            init.normal_(m.weight, std=.02)
             if isinstance(m, Linear) and m.bias is not None:
                 init.constant_(m.bias, 0)
         elif isinstance(m, LayerNorm):

@@ -18,21 +18,16 @@ Hacked together by / Copyright 2020 Ross Wightman (https://github.com/rwightman)
 import argparse
 import time
 import yaml
-import os
 import logging
 from collections import OrderedDict
 from contextlib import suppress
 
-from torch.utils.data import DataLoader
-
-"""
 from hybrid_dataset import HybridDataset
+from parser_csv import ParserCSV
 from speaker_dataset import SpeakerDataset
-from utils import update_graph, read_history_from_csv
-"""
+from utils import update_graph, read_history_from_csv, get_speaker_class_to_idx, get_gender_class_to_idx, \
+    get_corpus_class_to_idx
 
-import torch
-import torch.nn as nn
 import torchvision.utils
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
 
@@ -46,13 +41,8 @@ from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy, JsdCro
 from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.scheduler import create_scheduler
 from timm.utils import ApexScaler, NativeScaler
-from utils import *
+from custom_loader import create_loader as create_custom_loader
 from src import *
-from speaker_vgg_dataset import SpeakerVGGDataset
-from parser_csv import ParserCSV
-from custom_loader import create_custom_loader
-
-from mixup import FastCollateMixup as CustomFastCollateMixup
 
 try:
 
@@ -77,6 +67,7 @@ try:
     has_wandb = True
 except ImportError:
     has_wandb = False
+
 torch.backends.cudnn.benchmark = True
 _logger = logging.getLogger('train')
 
@@ -93,8 +84,9 @@ parser.add_argument('data_train_dir', metavar='DIR',
                     help='path to dataset')
 parser.add_argument('--data_eval_dir', metavar='DIR',
                     help='path to validation')
-parser.add_argument('--root_output_dir', default="./output/train", metavar='DIR',
-                    help='root output dir')
+
+parser.add_argument('--training_type', default='speaker', metavar='DIR',
+                    help='define if training is for speaker or gender')
 
 parser.add_argument('--save_graphs', action='store_true', default=False,
                     help='define if save graph of training/validation losses and accuracies')
@@ -257,6 +249,14 @@ parser.add_argument('--dist-bn', type=str, default='',
 parser.add_argument('--split-bn', action='store_true',
                     help='Enable separate BN layers per augmentation split.')
 
+# Model Exponential Moving Average
+parser.add_argument('--model-ema', action='store_true', default=False,
+                    help='Enable tracking moving average of model weights')
+parser.add_argument('--model-ema-force-cpu', action='store_true', default=False,
+                    help='Force ema to be tracked on CPU, rank=0 node only. Disables EMA validation.')
+parser.add_argument('--model-ema-decay', type=float, default=0.9998,
+                    help='decay factor for model weights moving average (default: 0.9998)')
+
 # Misc
 parser.add_argument('--seed', type=int, default=42, metavar='S',
                     help='random seed (default: 42)')
@@ -282,12 +282,21 @@ parser.add_argument('--pin-mem', action='store_true', default=False,
                     help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
 parser.add_argument('--no-prefetcher', action='store_true', default=False,
                     help='disable fast prefetcher')
+parser.add_argument('--output', default='', type=str, metavar='PATH',
+                    help='path to output folder (default: none, current dir)')
 parser.add_argument('--experiment', default='', type=str, metavar='NAME',
                     help='name of train experiment, name of sub-folder for output')
 parser.add_argument('--eval-metric', default='top1', type=str, metavar='EVAL_METRIC',
                     help='Best metric (default: "top1"')
 parser.add_argument('--tta', type=int, default=0, metavar='N',
                     help='Test/inference time augmentation (oversampling) factor. 0=None (default: 0)')
+parser.add_argument("--local_rank", default=0, type=int)
+parser.add_argument('--use-multi-epochs-loader', action='store_true', default=False,
+                    help='use the multi-epochs-loader to save time at the beginning of every epoch')
+parser.add_argument('--torchscript', dest='torchscript', action='store_true',
+                    help='convert model torchscript for inference')
+parser.add_argument('--log-wandb', action='store_true', default=False,
+                    help='log training and validation metrics to wandb')
 
 
 def _parse_args():
@@ -307,20 +316,32 @@ def _parse_args():
     return args, args_text
 
 
-def train(train_csv, eval_csv, output_dir, args, class_to_idx):
-    if has_wandb:
-        wandb.init(project=args.experiment, config=args)
-    else:
-        _logger.warning("You've requested to log metrics to wandb but package not found. "
-                        "Metrics not being logged to wandb, try `pip install wandb`")
+def train(train_csv, eval_csv, output_dir, class_to_idx, args):
+    if args.log_wandb:
+        if has_wandb:
+            wandb.init(project=args.experiment, config=args)
+        else:
+            _logger.warning("You've requested to log metrics to wandb but package not found. "
+                            "Metrics not being logged to wandb, try `pip install wandb`")
 
     args.prefetcher = not args.no_prefetcher
+    args.distributed = False
     if 'WORLD_SIZE' in os.environ:
         args.distributed = int(os.environ['WORLD_SIZE']) > 1
     args.device = 'cuda:0'
     args.world_size = 1
-
-    _logger.info('Training with a single process on 01 GPUs.')
+    args.rank = 0  # global rank
+    if args.distributed:
+        args.device = 'cuda:%d' % args.local_rank
+        torch.cuda.set_device(args.local_rank)
+        torch.distributed.init_process_group(backend='nccl', init_method='env://')
+        args.world_size = torch.distributed.get_world_size()
+        args.rank = torch.distributed.get_rank()
+        _logger.info('Training in distributed mode with multiple processes, 01 GPU per process. Process %d, total %d.'
+                     % (args.rank, args.world_size))
+    else:
+        _logger.info('Training with a single process on 01 GPUs.')
+    assert args.rank >= 0
 
     # resolve AMP arguments based on PyTorch / Apex availability
     use_amp = None
@@ -338,11 +359,10 @@ def train(train_csv, eval_csv, output_dir, args, class_to_idx):
         _logger.warning("Neither APEX or native Torch AMP is available, using float32. "
                         "Install NVIDA apex or upgrade to PyTorch 01.6")
 
-    random_seed(args.seed, 0)
+    random_seed(args.seed, args.rank)
 
     model = create_model(
         args.model,
-        img_size=args.input_size[1],
         pretrained=args.pretrained,
         num_classes=args.num_classes,
         drop_rate=args.drop,
@@ -353,12 +373,18 @@ def train(train_csv, eval_csv, output_dir, args, class_to_idx):
         bn_tf=args.bn_tf,
         bn_momentum=args.bn_momentum,
         bn_eps=args.bn_eps,
+        scriptable=args.torchscript,
         checkpoint_path=args.initial_checkpoint)
 
-    _logger.info(
-        f'Model {safe_model_name(args.model)} created, param count:{sum([m.numel() for m in model.parameters()])}')
+    if args.num_classes is None:
+        assert hasattr(model, 'num_classes'), 'Model must have `num_classes` attr if not set on cmd line/config.'
+        args.num_classes = model.num_classes  # FIXME handle model default vs config num_classes more elegantly
 
-    data_config = resolve_data_config(vars(args), model=model, verbose=True)
+    if args.local_rank == 0:
+        _logger.info(
+            f'Model {safe_model_name(args.model)} created, param count:{sum([m.numel() for m in model.parameters()])}')
+
+    data_config = resolve_data_config(vars(args), model=model, verbose=args.local_rank == 0)
 
     # setup augmentation batch splits for contrastive loss or split bn
     num_aug_splits = 0
@@ -373,6 +399,26 @@ def train(train_csv, eval_csv, output_dir, args, class_to_idx):
 
     # move model to GPU, enable channels last layout if set
     model.cuda()
+    if args.channels_last:
+        model = model.to(memory_format=torch.channels_last)
+
+    # setup synchronized BatchNorm for distributed training
+    if args.distributed and args.sync_bn:
+        assert not args.split_bn
+        if has_apex and use_amp != 'native':
+            # Apex SyncBN preferred unless native amp is activated
+            model = convert_syncbn_model(model)
+        else:
+            model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        if args.local_rank == 0:
+            _logger.info(
+                'Converted model to use Synchronized BatchNorm. WARNING: You may have issues if using '
+                'zero initialized BN layers (enabled by default for ResNets) while sync-bn enabled.')
+
+    if args.torchscript:
+        assert not use_amp == 'apex', 'Cannot use APEX AMP with torchscripted model'
+        assert not args.sync_bn, 'Cannot use SyncBatchNorm with torchscripted model'
+        model = torch.jit.script(model)
 
     optimizer = create_optimizer_v2(model, **optimizer_kwargs(cfg=args))
 
@@ -382,13 +428,16 @@ def train(train_csv, eval_csv, output_dir, args, class_to_idx):
     if use_amp == 'apex':
         model, optimizer = amp.initialize(model, optimizer, opt_level='O1')
         loss_scaler = ApexScaler()
-        _logger.info('Using NVIDIA APEX AMP. Training in mixed precision.')
+        if args.local_rank == 0:
+            _logger.info('Using NVIDIA APEX AMP. Training in mixed precision.')
     elif use_amp == 'native':
         amp_autocast = torch.cuda.amp.autocast
         loss_scaler = NativeScaler()
-        _logger.info('Using native Torch AMP. Training in mixed precision.')
+        if args.local_rank == 0:
+            _logger.info('Using native Torch AMP. Training in mixed precision.')
     else:
-        _logger.info('AMP not enabled. Training in float32.')
+        if args.local_rank == 0:
+            _logger.info('AMP not enabled. Training in float32.')
 
     # optionally resume from a checkpoint
     resume_epoch = None
@@ -399,6 +448,27 @@ def train(train_csv, eval_csv, output_dir, args, class_to_idx):
             loss_scaler=None if args.no_resume_opt else loss_scaler,
             log_info=args.local_rank == 0)
 
+    # setup exponential moving average of model weights, SWA could be used here too
+    model_ema = None
+    if args.model_ema:
+        # Important to create EMA model after cuda(), DP wrapper, and AMP but before SyncBN and DDP wrapper
+        model_ema = ModelEmaV2(
+            model, decay=args.model_ema_decay, device='cpu' if args.model_ema_force_cpu else None)
+        if args.resume:
+            load_checkpoint(model_ema.module, args.resume, use_ema=True)
+
+    # setup distributed training
+    if args.distributed:
+        if has_apex and use_amp != 'native':
+            # Apex DDP preferred unless native amp is activated
+            if args.local_rank == 0:
+                _logger.info("Using NVIDIA APEX DistributedDataParallel.")
+            model = ApexDDP(model, delay_allreduce=True)
+        else:
+            if args.local_rank == 0:
+                _logger.info("Using native Torch DistributedDataParallel.")
+            model = NativeDDP(model, device_ids=[args.local_rank])  # can use device str in Torch >= 01.01
+        # NOTE: EMA model does not need to be wrapped by DDP
 
     # setup learning rate schedule and starting epoch
     lr_scheduler, num_epochs = create_scheduler(args, optimizer)
@@ -411,21 +481,26 @@ def train(train_csv, eval_csv, output_dir, args, class_to_idx):
     if lr_scheduler is not None and start_epoch > 0:
         lr_scheduler.step(start_epoch)
 
-    _logger.info('Scheduled epochs: {}'.format(num_epochs))
+    if args.local_rank == 0:
+        _logger.info('Scheduled epochs: {}'.format(num_epochs))
 
     # read_wav = check_read_wav_from_model_name(args.model)
     first_part_model_name = model_name.split('_')[0]
-    second_part_model_name = model_name.split('_')[1]
-
-    read_vgg_features = False
-
-    if first_part_model_name == "speaker" and second_part_model_name == "vgg":
-        read_vgg_features = True
-        dataset_train = SpeakerVGGDataset(str(train_csv),
-                                          parser=ParserCSV(train_csv, class_to_idx=class_to_idx,
-                                                           read_vgg_features=True))
-        dataset_eval = SpeakerVGGDataset(str(eval_csv),
-                                         parser=ParserCSV(eval_csv, class_to_idx=class_to_idx, read_vgg_features=True))
+    read_wav = False
+    # create the train and eval datasets
+    if first_part_model_name == "hybrid":
+        read_wav = True
+        dataset_train = HybridDataset(str(train_csv),
+                                      parser=ParserCSV(train_csv, class_to_idx=class_to_idx, read_wav=True))
+        dataset_eval = HybridDataset(str(eval_csv),
+                                     parser=ParserCSV(eval_csv, class_to_idx=class_to_idx, read_wav=True))
+    elif first_part_model_name == "speaker":
+        read_wav = True
+        # cp = torch.load('./wav2vec_large.pt')
+        dataset_train = SpeakerDataset(str(train_csv),
+                                       parser=ParserCSV(train_csv, class_to_idx=class_to_idx, read_wav=True))
+        dataset_eval = SpeakerDataset(str(eval_csv),
+                                      parser=ParserCSV(eval_csv, class_to_idx=class_to_idx, read_wav=True))
     else:
         dataset_train = ImageDataset(str(train_csv), parser=ParserCSV(train_csv, class_to_idx=class_to_idx))
         dataset_eval = ImageDataset(str(eval_csv), parser=ParserCSV(eval_csv, class_to_idx=class_to_idx))
@@ -435,7 +510,6 @@ def train(train_csv, eval_csv, output_dir, args, class_to_idx):
     mixup_fn = None
     mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
 
-
     if mixup_active:
         mixup_args = dict(
             mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
@@ -443,11 +517,9 @@ def train(train_csv, eval_csv, output_dir, args, class_to_idx):
             label_smoothing=args.smoothing, num_classes=args.num_classes)
         if args.prefetcher:
             assert not num_aug_splits  # collate conflict (need to support deinterleaving in collate mixup)
-            #collate_fn = FastCollateMixup(**mixup_args)
-            collate_fn = CustomFastCollateMixup(**mixup_args)
+            collate_fn = FastCollateMixup(**mixup_args)
         else:
             mixup_fn = Mixup(**mixup_args)
-
 
     # wrap dataset in AugMix helper
     if num_aug_splits > 1:
@@ -457,8 +529,25 @@ def train(train_csv, eval_csv, output_dir, args, class_to_idx):
     train_interpolation = args.train_interpolation
     if args.no_aug or not train_interpolation:
         train_interpolation = data_config['interpolation']
+    """
+    loader_train = DataLoader(
+        dataset_train,
+        batch_size=args.batch_size,
+        num_workers=args.workers,
+        pin_memory=args.pin_mem,
+    )
 
-    if read_vgg_features:
+
+    loader_eval = DataLoader(
+        dataset_eval,
+        batch_size=args.validation_batch_size_multiplier * args.batch_size,
+        num_workers=args.workers,
+        pin_memory=args.pin_mem,
+    )
+
+    """
+
+    if read_wav:
         loader_train = create_custom_loader(
             dataset_train,
             input_size=data_config['input_size'],
@@ -481,8 +570,10 @@ def train(train_csv, eval_csv, output_dir, args, class_to_idx):
             mean=data_config['mean'],
             std=data_config['std'],
             num_workers=args.workers,
-            collate_fn=collate_fn,
+            distributed=args.distributed,
+            # collate_fn=collate_fn,
             pin_memory=args.pin_mem,
+            use_multi_epochs_loader=args.use_multi_epochs_loader
         )
 
         loader_eval = create_custom_loader(
@@ -495,6 +586,7 @@ def train(train_csv, eval_csv, output_dir, args, class_to_idx):
             mean=data_config['mean'],
             std=data_config['std'],
             num_workers=args.workers,
+            distributed=args.distributed,
             crop_pct=data_config['crop_pct'],
             pin_memory=args.pin_mem,
         )
@@ -522,8 +614,10 @@ def train(train_csv, eval_csv, output_dir, args, class_to_idx):
             mean=data_config['mean'],
             std=data_config['std'],
             num_workers=args.workers,
+            distributed=args.distributed,
             collate_fn=collate_fn,
             pin_memory=args.pin_mem,
+            use_multi_epochs_loader=args.use_multi_epochs_loader
         )
 
         loader_eval = create_loader(
@@ -536,6 +630,7 @@ def train(train_csv, eval_csv, output_dir, args, class_to_idx):
             mean=data_config['mean'],
             std=data_config['std'],
             num_workers=args.workers,
+            distributed=args.distributed,
             crop_pct=data_config['crop_pct'],
             pin_memory=args.pin_mem,
         )
@@ -547,7 +642,6 @@ def train(train_csv, eval_csv, output_dir, args, class_to_idx):
     elif mixup_active:
         # smoothing is handled with mixup target transform
         train_loss_fn = SoftTargetCrossEntropy().cuda()
-
     elif args.smoothing:
         train_loss_fn = LabelSmoothingCrossEntropy(smoothing=args.smoothing).cuda()
     else:
@@ -558,19 +652,14 @@ def train(train_csv, eval_csv, output_dir, args, class_to_idx):
     eval_metric = args.eval_metric
     best_metric = None
     best_epoch = None
-    decreasing = True if eval_metric == 'loss' else False
-    saver = CheckpointSaver(
-        model=model, optimizer=optimizer, args=args, amp_scaler=loss_scaler,
-        checkpoint_dir=output_dir, recovery_dir=output_dir, decreasing=decreasing, max_history=args.checkpoint_hist)
-    with open(os.path.join(output_dir, 'args.yaml'), 'w') as f:
-        f.write(args_text)
-    """
-    saver = Saver(
-        model=model, optimizer=optimizer, args=args, model_ema=model_ema, amp_scaler=loss_scaler,
-        checkpoint_dir=output_dir, recovery_dir=output_dir, decreasing=decreasing, max_history=args.checkpoint_hist)
-    with open(os.path.join(output_dir, 'args.yaml'), 'w') as f:
-        f.write(args_text)
-    """
+    saver = None
+    if args.rank == 0:
+        decreasing = True if eval_metric == 'loss' else False
+        saver = CheckpointSaver(
+            model=model, optimizer=optimizer, args=args, model_ema=model_ema, amp_scaler=loss_scaler,
+            checkpoint_dir=output_dir, recovery_dir=output_dir, decreasing=decreasing, max_history=args.checkpoint_hist)
+        with open(os.path.join(output_dir, 'args.yaml'), 'w') as f:
+            f.write(args_text)
 
     train_loss_history, val_loss_history, train_acc_history, val_acc_history = [], [], [], []
     if args.resume:
@@ -578,11 +667,18 @@ def train(train_csv, eval_csv, output_dir, args, class_to_idx):
 
     try:
         for epoch in range(start_epoch, num_epochs):
+            if args.distributed and hasattr(loader_train.sampler, 'set_epoch'):
+                loader_train.sampler.set_epoch(epoch)
 
             train_metrics = train_one_epoch(
                 epoch, model, loader_train, optimizer, train_loss_fn, args,
                 lr_scheduler=lr_scheduler, saver=saver, output_dir=output_dir,
-                amp_autocast=amp_autocast, loss_scaler=loss_scaler, mixup_fn=mixup_fn)
+                amp_autocast=amp_autocast, loss_scaler=loss_scaler, model_ema=model_ema, mixup_fn=mixup_fn)
+
+            if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
+                if args.local_rank == 0:
+                    _logger.info("Distributing BatchNorm running means and vars")
+                distribute_bn(model, args.world_size, args.dist_bn == 'reduce')
 
             eval_metrics = validate(model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast)
 
@@ -592,6 +688,14 @@ def train(train_csv, eval_csv, output_dir, args, class_to_idx):
                 val_acc_history.append(eval_metrics["top1"])
                 update_graph(train_loss_history, val_loss_history, val_acc_history, os.path.join(output_dir, "graphs"))
 
+            if model_ema is not None and not args.model_ema_force_cpu:
+                if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
+                    distribute_bn(model_ema, args.world_size, args.dist_bn == 'reduce')
+                ema_eval_metrics = validate(
+                    model_ema.module, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast,
+                    log_suffix=' (EMA)')
+                eval_metrics = ema_eval_metrics
+
             if lr_scheduler is not None:
                 # step LR for next epoch
                 lr_scheduler.step(epoch + 1, eval_metrics[eval_metric])
@@ -599,7 +703,7 @@ def train(train_csv, eval_csv, output_dir, args, class_to_idx):
             if output_dir is not None:
                 update_summary(
                     epoch, train_metrics, eval_metrics, os.path.join(output_dir, 'summary.csv'),
-                    write_header=best_metric is None)
+                    write_header=best_metric is None, log_wandb=args.log_wandb and has_wandb)
 
             if saver is not None:
                 # save proper checkpoint with eval metric
@@ -615,7 +719,7 @@ def train(train_csv, eval_csv, output_dir, args, class_to_idx):
 def train_one_epoch(
         epoch, model, loader, optimizer, loss_fn, args,
         lr_scheduler=None, saver=None, output_dir=None, amp_autocast=suppress,
-        loss_scaler=None, mixup_fn=None):
+        loss_scaler=None, model_ema=None, mixup_fn=None):
     if args.mixup_off_epoch and epoch >= args.mixup_off_epoch:
         if args.prefetcher and loader.mixup_enabled:
             loader.mixup_enabled = False
@@ -633,21 +737,22 @@ def train_one_epoch(
     last_idx = len(loader) - 1
     num_updates = epoch * len(loader)
     for batch_idx, (input, target) in enumerate(loader):
-
         last_batch = batch_idx == last_idx
         data_time_m.update(time.time() - end)
+        if not args.prefetcher:
+            input_img, input_wav, target = input[0].cuda(), input[1].cuda(), target.cuda()
+            # input_img, target = input, target
+            if mixup_fn is not None:
+                input, target = mixup_fn(input_img, target)
+        if args.channels_last:
+            input = input.contiguous(memory_format=torch.channels_last)
 
         with amp_autocast():
             output = model(input)
             loss = loss_fn(output, target)
 
-        if isinstance(input, tuple):
-            input_size = input[0].size(0)
-        else:
-            input_size = input.size(0)
-
-        losses_m.update(loss.item(), input_size)
-
+        if not args.distributed:
+            losses_m.update(loss.item(), input.size(0))
 
         optimizer.zero_grad()
         if loss_scaler is not None:
@@ -664,6 +769,9 @@ def train_one_epoch(
                     value=args.clip_grad, mode=args.clip_mode)
             optimizer.step()
 
+        if model_ema is not None:
+            model_ema.update(model)
+
         torch.cuda.synchronize()
         num_updates += 1
         batch_time_m.update(time.time() - end)
@@ -671,29 +779,34 @@ def train_one_epoch(
             lrl = [param_group['lr'] for param_group in optimizer.param_groups]
             lr = sum(lrl) / len(lrl)
 
-            _logger.info(
-                'Train: {} [{:>4d}/{} ({:>3.0f}%)]  '
-                'Loss: {loss.val:>9.6f} ({loss.avg:>6.4f})  '
-                'Time: {batch_time.val:.3f}s, {rate:>7.2f}/s  '
-                '({batch_time.avg:.3f}s, {rate_avg:>7.2f}/s)  '
-                'LR: {lr:.3e}  '
-                'Data: {data_time.val:.3f} ({data_time.avg:.3f})'.format(
-                    epoch,
-                    batch_idx, len(loader),
-                    100. * batch_idx / last_idx,
-                    loss=losses_m,
-                    batch_time=batch_time_m,
-                    rate=input_size * args.world_size / batch_time_m.val,
-                    rate_avg=input_size * args.world_size / batch_time_m.avg,
-                    lr=lr,
-                    data_time=data_time_m))
+            if args.distributed:
+                reduced_loss = reduce_tensor(loss.data, args.world_size)
+                losses_m.update(reduced_loss.item(), input.size(0))
 
-            if args.save_images and output_dir:
-                torchvision.utils.save_image(
-                    input,
-                    os.path.join(output_dir, 'train-batch-%d.jpg' % batch_idx),
-                    padding=0,
-                    normalize=True)
+            if args.local_rank == 0:
+                _logger.info(
+                    'Train: {} [{:>4d}/{} ({:>3.0f}%)]  '
+                    'Loss: {loss.val:>9.6f} ({loss.avg:>6.4f})  '
+                    'Time: {batch_time.val:.3f}s, {rate:>7.2f}/s  '
+                    '({batch_time.avg:.3f}s, {rate_avg:>7.2f}/s)  '
+                    'LR: {lr:.3e}  '
+                    'Data: {data_time.val:.3f} ({data_time.avg:.3f})'.format(
+                        epoch,
+                        batch_idx, len(loader),
+                        100. * batch_idx / last_idx,
+                        loss=losses_m,
+                        batch_time=batch_time_m,
+                        rate=input.size(0) * args.world_size / batch_time_m.val,
+                        rate_avg=input.size(0) * args.world_size / batch_time_m.avg,
+                        lr=lr,
+                        data_time=data_time_m))
+
+                if args.save_images and output_dir:
+                    torchvision.utils.save_image(
+                        input,
+                        os.path.join(output_dir, 'train-batch-%d.jpg' % batch_idx),
+                        padding=0,
+                        normalize=True)
 
         if saver is not None and args.recovery_interval and (
                 last_batch or (batch_idx + 1) % args.recovery_interval == 0):
@@ -740,24 +853,25 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
                 output = output.unfold(0, reduce_factor, reduce_factor).mean(dim=2)
                 target = target[0:target.size(0):reduce_factor]
 
-
             loss = loss_fn(output, target)
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
 
-            reduced_loss = loss.data
+            if args.distributed:
+                reduced_loss = reduce_tensor(loss.data, args.world_size)
+                acc1 = reduce_tensor(acc1, args.world_size)
+                acc5 = reduce_tensor(acc5, args.world_size)
+            else:
+                reduced_loss = loss.data
 
             torch.cuda.synchronize()
-            if isinstance(input, tuple):
-                input_size = input[0].size(0)
-            else:
-                input_size = input.size(0)
-            losses_m.update(reduced_loss.item(), input_size)
+
+            losses_m.update(reduced_loss.item(), input.size(0))
             top1_m.update(acc1.item(), output.size(0))
             top5_m.update(acc5.item(), output.size(0))
 
             batch_time_m.update(time.time() - end)
             end = time.time()
-            if (last_batch or batch_idx % args.log_interval == 0):
+            if args.local_rank == 0 and (last_batch or batch_idx % args.log_interval == 0):
                 log_name = 'Test' + log_suffix
                 _logger.info(
                     '{0}: [{1:>4d}/{2}]  '
@@ -783,63 +897,17 @@ if __name__ == '__main__':
     else:
         model_name = '-'.join(
             [safe_model_name(args.model), 'scratch'])
-
-    dataset = get_dataset_name_from_path(args.data_train_dir)
-    num_classes_experiment = get_classes_name_from_path(args.data_train_dir)
-    aug_type = get_aug_type_from_path(args.data_train_dir)
-    exp_type = get_exp_type_from_path(args.data_train_dir)
-
-    assert exp_type == "within-corpus" or exp_type == "IEMOCAP_train" or exp_type == "cross-corpus" \
-           or exp_type == "cross-corpus-demos"
-
-    root_output_dir = os.path.join(args.root_output_dir, exp_type, model_name, dataset,
-                                   num_classes_experiment, aug_type)
-    class_to_idx = get_class_to_idx(dataset, num_classes_experiment)
-    folders = [os.path.basename(f.path) for f in os.scandir(args.data_train_dir) if f.is_dir()]
-
-    if exp_type == "within-corpus":
-        for idx, subject in enumerate(folders):
-            print("TRAIN MODELS FOR TEST FOLDER " + str(idx + 1) + "/" + str(len(folders)))
-            output_subject_dir = os.path.join(root_output_dir, subject)
-            subject_dir = os.path.join(args.data_train_dir, subject, "train", "datasets")
-            subjects_val = [os.path.basename(f.path) for f in os.scandir(subject_dir) if f.is_dir()]
-            for idx_val, subject_val in enumerate(subjects_val):
-                print("----TRAIN MODELS FOR TEST FOLDER " + str(idx + 1) + "/" + str(len(folders)) + " (" + str(
-                    subject) + "): VALIDATION " + str(
-                    idx_val + 1) + "/" + str(len(subjects_val)) + " (" + str(subject_val) + ")")
-                current_train_csv = os.path.join(subject_dir, subject_val, "train", "dataset.csv")
-                current_eval_csv = os.path.join(subject_dir, subject_val, "validation", "dataset.csv")
-                output_sub_subject_dir = os.path.join(output_subject_dir, subject_val)
-                if os.path.exists(output_sub_subject_dir):
-                    continue
-                else:
-                    os.makedirs(output_sub_subject_dir)
-                    train(current_train_csv, current_eval_csv, output_sub_subject_dir, args, class_to_idx)
-
-    elif exp_type == "IEMOCAP_train":
-        for idx, subject in enumerate(folders):
-            print("TRAIN MODELS FOR TEST FOLDER " + str(idx + 1) + "/" + str(len(folders)))
-            output_subject_dir = os.path.join(root_output_dir, subject)
-            subject_train_csv = os.path.join(args.data_train_dir, subject, "train", "dataset.csv")
-            subject_val_csv = os.path.join(args.data_train_dir, subject, "validation", "dataset.csv")
-            if os.path.exists(output_subject_dir):
-                continue
-            else:
-                os.makedirs(output_subject_dir)
-                train(subject_train_csv, subject_val_csv, output_subject_dir, args, class_to_idx)
-
-    elif exp_type == "cross-corpus" or exp_type == "cross-corpus-demos":
-        for idx, corpus in enumerate(folders):
-            print("TRAIN MODELS FOR TEST FOLDER " + str(idx + 1) + "/" + str(len(folders)))
-            output_corpus_dir = os.path.join(root_output_dir, corpus)
-            corpus_train_csv = os.path.join(args.data_train_dir, corpus, "train", "dataset.csv")
-            corpus_eval_csv = os.path.join(args.data_train_dir, corpus, "validation", "dataset.csv")
-
-            if os.path.exists(output_corpus_dir):
-                continue
-            else:
-                os.makedirs(output_corpus_dir)
-                train(corpus_train_csv, corpus_eval_csv, output_corpus_dir, args, class_to_idx)
-
+    model_type = '-'.join((args.training_type, 'models'))
+    root_output_dir = os.path.join("./output/train", model_type, model_name)
+    if not os.path.exists(root_output_dir):
+        os.makedirs(root_output_dir)
+    class_to_idx = {}
+    if args.training_type == "speaker":
+        class_to_idx = get_speaker_class_to_idx()
+    elif args.training_type == "gender":
+        class_to_idx = get_gender_class_to_idx()
+    elif args.training_type == "corpus":
+        class_to_idx = get_corpus_class_to_idx()
     else:
         exit(0)
+    train(args.data_train_dir, args.data_eval_dir, root_output_dir, class_to_idx, args)

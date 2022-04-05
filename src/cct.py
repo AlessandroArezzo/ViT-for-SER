@@ -1,5 +1,6 @@
 from torch.hub import load_state_dict_from_url
 import torch.nn as nn
+
 from .utils.transformers import TransformerClassifier
 from .utils.tokenizer import Tokenizer
 from .utils.helpers import pe_check, fc_check
@@ -141,7 +142,6 @@ def cct_14(arch, pretrained, progress, *args, **kwargs):
     return _cct(arch, pretrained, progress, num_layers=14, num_heads=6, mlp_ratio=3, embedding_dim=384,
                 *args, **kwargs)
 
-
 @register_model
 def cct_2_3x2_32(pretrained=False, progress=False,
                  img_size=32, positional_embedding='learnable', num_classes=10,
@@ -239,7 +239,6 @@ def cct_7_3x1_32(pretrained=False, progress=False,
                  img_size=img_size, positional_embedding=positional_embedding,
                  num_classes=num_classes,
                  *args, **kwargs)
-
 
 @register_model
 def cct_7_3x1_32_sine(pretrained=False, progress=False,
