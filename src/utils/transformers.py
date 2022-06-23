@@ -99,6 +99,24 @@ class TransformerEncoderLayer(Module):
         src = src + self.drop_path(self.dropout2(src2))
         return src
 
+class TransformerEncoderScndLevelLayer(Module):
+    """
+    Inspired by torch.nn.TransformerEncoderLayer and timm.
+    """
+
+    def __init__(self, d_model, nhead):
+        super(TransformerEncoderScndLevelLayer, self).__init__()
+        self.pre_norm = LayerNorm(d_model)
+        self.self_attn = Attention(dim=d_model, num_heads=nhead,
+                                   attention_dropout=0., projection_dropout=0.)
+
+
+        self.activation = F.gelu
+
+    def forward(self, src: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        src = src + self.self_attn(self.pre_norm(src))
+        return src
+
 
 class MaskedTransformerEncoderLayer(Module):
     """
@@ -229,6 +247,30 @@ class TransformerClassifier(Module):
         pe[:, 0::2] = torch.sin(pe[:, 0::2])
         pe[:, 1::2] = torch.cos(pe[:, 1::2])
         return pe.unsqueeze(0)
+
+    def extract_embedding(self, x):
+        if self.positional_emb is None and x.size(1) < self.sequence_length:
+            x = F.pad(x, (0, 0, 0, self.n_channels - x.size(1)), mode='constant', value=0)
+
+        if not self.seq_pool:
+            cls_token = self.class_emb.expand(x.shape[0], -1, -1)
+            x = torch.cat((cls_token, x), dim=1)
+
+        if self.positional_emb is not None:
+            x += self.positional_emb
+
+        x = self.dropout(x)
+
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.norm(x)
+
+        if self.seq_pool:
+            x = torch.matmul(F.softmax(self.attention_pool(x), dim=1).transpose(-1, -2), x).squeeze(-2)
+        else:
+            x = x[:, 0]
+
+        return x
 
 
 class MaskedTransformerClassifier(Module):

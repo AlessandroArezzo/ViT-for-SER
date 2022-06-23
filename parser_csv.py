@@ -27,7 +27,8 @@ class ParserCSV(Parser):
             return (open(path, "rb"), self.wav_data[index]), target
         if len(self.vgg_features):
             sample_dataset = self.__get_dataset_from_filename(path)
-            current_vgg_features = self.vgg_features[sample_dataset][os.path.basename(path).split('.')[0]]
+            filename_without_augmentations = self.__remove_augmentation_from_filename(os.path.basename(path))
+            current_vgg_features = self.vgg_features[sample_dataset][os.path.basename(filename_without_augmentations).split('.')[0]]
             return (open(path, "rb"), current_vgg_features), target
         return open(path, "rb"), target
 
@@ -44,7 +45,7 @@ class ParserCSV(Parser):
         all_dataset_files = []
         classes_files = []
         for idx, row in enumerate(csvreader):
-            if idx > 0:
+            if idx > 0 and row[0] != 'path_file':
                 all_dataset_files.append(row[0])
                 classes_files.append(row[1])
         return all_dataset_files, classes_files
@@ -84,7 +85,10 @@ class ParserCSV(Parser):
             root_path = os.path.split(os.path.split(first_spectrogram_path)[0])[0]
             dataset_upper_case = dataset.upper()
             vgg_features_folder = '_'.join([dataset_upper_case, 'vgg_vox_features'])
-            vgg_features_path = os.path.join(root_path, vgg_features_folder, "vggvox_features.pkl")
+            #vgg_features_path = os.path.join(root_path, vgg_features_folder, "vggvox_features.pkl")
+            #vgg_features_path = os.path.join(root_path, vgg_features_folder, "PCA_vggvox_features.pkl")
+            vgg_features_path = os.path.join(root_path, vgg_features_folder, "PCA_cross-corpus_vggvox_features.pkl")
+            #vgg_features_path = os.path.join(root_path, vgg_features_folder, "PCA_cross-corpus_vggvox_features_neutral_for_all.pkl")
             with open(vgg_features_path, 'rb') as handle:
                 vgg_features[dataset] = pickle.load(handle)
         return vgg_features
@@ -96,7 +100,7 @@ class ParserCSV(Parser):
 
         last_part_filename = splitted_filename[len(splitted_filename) - 1]
         if last_part_filename in augmentations_methods:
-            '_'.join(name.split('_')[:-1])
+            name = '_'.join(name.split('_')[:-1])
 
         filename_without_last_part = '.'.join([name, 'wav'])
 

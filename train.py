@@ -95,6 +95,10 @@ parser.add_argument('--data_eval_dir', metavar='DIR',
                     help='path to validation')
 parser.add_argument('--root_output_dir', default="./output/train", metavar='DIR',
                     help='root output dir')
+parser.add_argument('--pretrained_model', default="", metavar='DIR',
+                    help='pretrained model to finetuned')
+parser.add_argument('--weights_regularization', action='store_true', default=False,
+                    help='Define if apply weights regularization to the fully connected layer of the model')
 
 parser.add_argument('--save_graphs', action='store_true', default=False,
                     help='define if save graph of training/validation losses and accuracies')
@@ -307,7 +311,7 @@ def _parse_args():
     return args, args_text
 
 
-def train(train_csv, eval_csv, output_dir, args, class_to_idx):
+def train(train_csv, eval_csv, output_dir, args, class_to_idx, pretrained_model=''):
     if has_wandb:
         wandb.init(project=args.experiment, config=args)
     else:
@@ -339,7 +343,6 @@ def train(train_csv, eval_csv, output_dir, args, class_to_idx):
                         "Install NVIDA apex or upgrade to PyTorch 01.6")
 
     random_seed(args.seed, 0)
-
     model = create_model(
         args.model,
         img_size=args.input_size[1],
@@ -353,7 +356,7 @@ def train(train_csv, eval_csv, output_dir, args, class_to_idx):
         bn_tf=args.bn_tf,
         bn_momentum=args.bn_momentum,
         bn_eps=args.bn_eps,
-        checkpoint_path=args.initial_checkpoint)
+        checkpoint_path=pretrained_model)
 
     _logger.info(
         f'Model {safe_model_name(args.model)} created, param count:{sum([m.numel() for m in model.parameters()])}')
@@ -414,8 +417,14 @@ def train(train_csv, eval_csv, output_dir, args, class_to_idx):
     _logger.info('Scheduled epochs: {}'.format(num_epochs))
 
     # read_wav = check_read_wav_from_model_name(args.model)
-    first_part_model_name = model_name.split('_')[0]
-    second_part_model_name = model_name.split('_')[1]
+    first_part_model_name = ""
+    second_part_model_name = ""
+    if model_name != "resnet50-pretrained":
+        try:
+            first_part_model_name = model_name.split('_')[0]
+            second_part_model_name = model_name.split('_')[1]
+        except:
+            pass
 
     read_vgg_features = False
 
@@ -582,7 +591,8 @@ def train(train_csv, eval_csv, output_dir, args, class_to_idx):
             train_metrics = train_one_epoch(
                 epoch, model, loader_train, optimizer, train_loss_fn, args,
                 lr_scheduler=lr_scheduler, saver=saver, output_dir=output_dir,
-                amp_autocast=amp_autocast, loss_scaler=loss_scaler, mixup_fn=mixup_fn)
+                amp_autocast=amp_autocast, loss_scaler=loss_scaler, mixup_fn=mixup_fn,
+                pretrained_model=pretrained_model)
 
             eval_metrics = validate(model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast)
 
@@ -615,7 +625,7 @@ def train(train_csv, eval_csv, output_dir, args, class_to_idx):
 def train_one_epoch(
         epoch, model, loader, optimizer, loss_fn, args,
         lr_scheduler=None, saver=None, output_dir=None, amp_autocast=suppress,
-        loss_scaler=None, mixup_fn=None):
+        loss_scaler=None, mixup_fn=None, pretrained_model=''):
     if args.mixup_off_epoch and epoch >= args.mixup_off_epoch:
         if args.prefetcher and loader.mixup_enabled:
             loader.mixup_enabled = False
@@ -628,6 +638,18 @@ def train_one_epoch(
     losses_m = AverageMeter()
 
     model.train()
+    """
+    if args.model.split('_')[0] == "speaker" and args.model.split('_')[1] == "vgg":
+        if model.classifier.gender_embedder:
+            model.classifier.gender_embedder.requires_grad = False
+        if model.classifier.corpus_embedder:
+            model.classifier.corpus_embedder.requires_grad = False
+    """
+
+    """
+    if pretrained_model != '':
+        model.block_weights()
+    """
 
     end = time.time()
     last_idx = len(loader) - 1
@@ -640,6 +662,13 @@ def train_one_epoch(
         with amp_autocast():
             output = model(input)
             loss = loss_fn(output, target)
+            if args.weights_regularization:
+                l1_norm = 0
+                try:
+                    l1_norm = model.weight_regularization()
+                except:
+                    pass
+                loss += l1_norm
 
         if isinstance(input, tuple):
             input_size = input[0].size(0)
@@ -790,14 +819,16 @@ if __name__ == '__main__':
     exp_type = get_exp_type_from_path(args.data_train_dir)
 
     assert exp_type == "within-corpus" or exp_type == "IEMOCAP_train" or exp_type == "cross-corpus" \
-           or exp_type == "cross-corpus-demos"
+           or exp_type == "cross-corpus-demos" or exp_type == "cross-corpus-men" or exp_type == "cross-corpus-women"
 
-    root_output_dir = os.path.join(args.root_output_dir, exp_type, model_name, dataset,
-                                   num_classes_experiment, aug_type)
-    class_to_idx = get_class_to_idx(dataset, num_classes_experiment)
-    folders = [os.path.basename(f.path) for f in os.scandir(args.data_train_dir) if f.is_dir()]
+    if args.pretrained_model != "":
+        dataset = ('-').join([dataset, "finetuned"])
 
     if exp_type == "within-corpus":
+        root_output_dir = os.path.join(args.root_output_dir, exp_type, model_name, dataset,
+                                       num_classes_experiment, aug_type)
+        class_to_idx = get_class_to_idx(dataset, num_classes_experiment)
+        folders = [os.path.basename(f.path) for f in os.scandir(args.data_train_dir) if f.is_dir()]
         for idx, subject in enumerate(folders):
             print("TRAIN MODELS FOR TEST FOLDER " + str(idx + 1) + "/" + str(len(folders)))
             output_subject_dir = os.path.join(root_output_dir, subject)
@@ -814,9 +845,13 @@ if __name__ == '__main__':
                     continue
                 else:
                     os.makedirs(output_sub_subject_dir)
-                    train(current_train_csv, current_eval_csv, output_sub_subject_dir, args, class_to_idx)
+                    train(current_train_csv, current_eval_csv, output_sub_subject_dir, args, class_to_idx, args.pretrained_model)
 
     elif exp_type == "IEMOCAP_train":
+        root_output_dir = os.path.join(args.root_output_dir, exp_type, model_name,
+                                       num_classes_experiment, aug_type)
+        class_to_idx = get_class_to_idx("IEMOCAP", num_classes_experiment)
+        folders = [os.path.basename(f.path) for f in os.scandir(args.data_train_dir) if f.is_dir()]
         for idx, subject in enumerate(folders):
             print("TRAIN MODELS FOR TEST FOLDER " + str(idx + 1) + "/" + str(len(folders)))
             output_subject_dir = os.path.join(root_output_dir, subject)
@@ -826,10 +861,19 @@ if __name__ == '__main__':
                 continue
             else:
                 os.makedirs(output_subject_dir)
-                train(subject_train_csv, subject_val_csv, output_subject_dir, args, class_to_idx)
+                train(subject_train_csv, subject_val_csv, output_subject_dir, args, class_to_idx, args.pretrained_model)
 
-    elif exp_type == "cross-corpus" or exp_type == "cross-corpus-demos":
+    elif exp_type == "cross-corpus" or exp_type == "cross-corpus-demos" or exp_type == "cross-corpus-men" \
+            or exp_type == "cross-corpus-women":
+        root_output_dir = os.path.join(args.root_output_dir, exp_type, model_name, dataset,
+                                       num_classes_experiment, aug_type)
+        class_to_idx = get_class_to_idx(dataset, num_classes_experiment)
+        folders = [os.path.basename(f.path) for f in os.scandir(args.data_train_dir) if f.is_dir()]
         for idx, corpus in enumerate(folders):
+            root_output_dir = os.path.join(args.root_output_dir, exp_type, model_name, dataset,
+                                           num_classes_experiment, aug_type)
+            class_to_idx = get_class_to_idx(dataset, num_classes_experiment)
+            folders = [os.path.basename(f.path) for f in os.scandir(args.data_train_dir) if f.is_dir()]
             print("TRAIN MODELS FOR TEST FOLDER " + str(idx + 1) + "/" + str(len(folders)))
             output_corpus_dir = os.path.join(root_output_dir, corpus)
             corpus_train_csv = os.path.join(args.data_train_dir, corpus, "train", "dataset.csv")
@@ -839,7 +883,7 @@ if __name__ == '__main__':
                 continue
             else:
                 os.makedirs(output_corpus_dir)
-                train(corpus_train_csv, corpus_eval_csv, output_corpus_dir, args, class_to_idx)
+                train(corpus_train_csv, corpus_eval_csv, output_corpus_dir, args, class_to_idx, args.pretrained_model)
 
     else:
         exit(0)

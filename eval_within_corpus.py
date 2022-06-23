@@ -1,5 +1,3 @@
-import os
-import yaml
 import argparse
 
 from timm.data import create_loader, resolve_data_config, ImageDataset
@@ -10,11 +8,10 @@ import torch
 from custom_loader import create_custom_loader
 from parser_csv import ParserCSV
 from speaker_vgg_dataset import SpeakerVGGDataset
-from utils import save_performance, save_confusion_matrix, get_class_labels
-import numpy as np
+
 from utils import *
 from src import *
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, balanced_accuracy_score
 
 import logging
 
@@ -118,7 +115,7 @@ def main():
     args = parser.parse_args()
     first_folder = [f.path for f in os.scandir(args.model_path) if f.is_dir()][0]
     config_file = os.path.join([f.path for f in os.scandir(first_folder) if f.is_dir()][0], "args.yaml")
-
+    #print(config_file)
     args, args_text = _parse_args(config_file)
 
     pretrained_str = ""
@@ -150,9 +147,8 @@ def main():
     folders = [os.path.basename(f.path) for f in os.scandir(args.data_test_path) if f.is_dir()]
 
     accuracy_tot, micro_precision_tot, macro_precision_tot, micro_recall_tot, macro_recall_tot, \
-    micro_f1_tot, macro_f1_tot = 0, 0, 0, 0, 0, 0, 0
+    micro_f1_tot, macro_f1_tot, uar_tot = 0, 0, 0, 0, 0, 0, 0, 0
     cm_tot = np.zeros((args.num_classes, args.num_classes))
-
 
     for idx, folder in enumerate(folders):
         print("PROCESS FOLDER " + str(idx+1) + "/" + str(len(folders)))
@@ -167,7 +163,7 @@ def main():
         eval_models_dirs = [f.path for f in os.scandir(os.path.join(args.model_path, folder)) if f.is_dir()]
 
         accuracy_folder,  micro_precision_folder, macro_precision_folder, micro_recall_folder, macro_recall_folder,\
-        micro_f1_folder, macro_f1_folder = 0, 0, 0, 0, 0, 0, 0
+        micro_f1_folder, macro_f1_folder, uar_folder = 0, 0, 0, 0, 0, 0, 0, 0
         cm_folder = np.zeros((args.num_classes, args.num_classes))
 
         for eval_model_dir in eval_models_dirs:
@@ -204,9 +200,14 @@ def main():
 
             config = resolve_data_config(vars(args), model=model)
             model.cuda()
+            first_part_model_name = ""
+            second_part_model_name = ""
+            try:
+                first_part_model_name = args.model.split('_')[0]
+                second_part_model_name = args.model.split('_')[1]
+            except:
+                pass
 
-            first_part_model_name = args.model.split('_')[0]
-            second_part_model_name = args.model.split('_')[1]
             read_vgg_features = False
 
             # create the train and eval datasets
@@ -277,6 +278,7 @@ def main():
             macro_recall_folder += recall_score(y_test_true, y_test_predicted, average="macro")
             micro_f1_folder += f1_score(y_test_true, y_test_predicted, average="micro")
             macro_f1_folder += f1_score(y_test_true, y_test_predicted, average="macro")
+            uar_folder += balanced_accuracy_score(y_test_true, y_test_predicted)
 
             cm_folder += confusion_matrix(y_test_true, y_test_predicted, labels=[class_labels_in_order[c] for c in class_labels_in_order],
                                           normalize='true')
@@ -291,6 +293,7 @@ def main():
         macro_recall = macro_recall_folder / len(eval_models_dirs)
         micro_f1 = micro_f1_folder / len(eval_models_dirs)
         macro_f1 = macro_f1_folder / len(eval_models_dirs)
+        uar = uar_folder / len(eval_models_dirs)
 
         cm = cm_folder / len(eval_models_dirs)
         sum_of_rows = cm.sum(axis=1)
@@ -303,7 +306,8 @@ def main():
                        "micro_f1": str(micro_f1 * 100),
                        "macro_precision": str(macro_precision * 100),
                        "macro_recall": str(macro_recall * 100),
-                       "macro_f1": str(macro_f1 * 100), }
+                       "macro_f1": str(macro_f1 * 100),
+                       "uar": str(uar * 100)}
 
         accuracy_tot += accuracy
         micro_precision_tot += micro_precision
@@ -312,6 +316,7 @@ def main():
         macro_recall_tot += macro_recall
         micro_f1_tot += micro_f1
         macro_f1_tot += macro_f1
+        uar_tot += uar
 
         cm_tot += cm
 
@@ -331,6 +336,7 @@ def main():
     macro_precision = macro_recall_tot / len(folders)
     macro_recall = micro_f1_tot / len(folders)
     macro_f1 = macro_f1_tot / len(folders)
+    uar = uar_tot / len(folders)
 
     cm = cm_tot / len(folders)
     sum_of_rows = cm.sum(axis=1)
@@ -343,7 +349,8 @@ def main():
                    "micro_f1": str(micro_f1 * 100),
                    "macro_precision": str(macro_precision * 100),
                    "macro_recall": str(macro_recall * 100),
-                   "macro_f1": str(macro_f1 * 100), }
+                   "macro_f1": str(macro_f1 * 100),
+                   "uar": str(uar * 100), }
 
     performance_output_file_path = os.path.join(output_dir, "performance.yaml")
     save_performance(model_stats, performance_output_file_path)

@@ -4,6 +4,6 @@ from .vit import *
 from .memory_cct import *
 from .memory_cvt import *
 from .parallel_memory_vit import *
-from .speaker_cct import *
-from .hybrid_cct import *
 from .speaker_vgg_vox_cct import *
+from .resnet import *
+from .speaker_vgg_vox_cct_endtoend import *

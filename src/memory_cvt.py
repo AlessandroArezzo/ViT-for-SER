@@ -91,6 +91,15 @@ def mcvt_4_2_32(img_size=32, positional_embedding='learnable', num_classes=10,
                         num_classes=num_classes,
                         *args, **kwargs)
 
+@register_model
+def mcvt_4_4_32(img_size=32, positional_embedding='learnable', num_classes=10,
+                *args, **kwargs):
+    return memory_cvt_4(arch='mcvt_4_4_32',
+                        width_patches=4,
+                        img_size=img_size, positional_embedding=positional_embedding,
+                        num_classes=num_classes,
+                        *args, **kwargs)
+
 
 @register_model
 def mcvt_7_1_32(img_size=32, positional_embedding='learnable', num_classes=10,
@@ -107,6 +116,15 @@ def mcvt_7_2_32(img_size=32, positional_embedding='learnable', num_classes=10,
                 *args, **kwargs):
     return memory_cvt_7(arch='mcvt_7_2_32',
                         width_patches=2,
+                        img_size=img_size, positional_embedding=positional_embedding,
+                        num_classes=num_classes,
+                        *args, **kwargs)
+
+@register_model
+def mcvt_7_8_32(img_size=32, positional_embedding='learnable', num_classes=10,
+                *args, **kwargs):
+    return memory_cvt_7(arch='mcvt_7_8_32',
+                        width_patches=8,
                         img_size=img_size, positional_embedding=positional_embedding,
                         num_classes=num_classes,
                         *args, **kwargs)

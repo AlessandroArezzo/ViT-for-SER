@@ -97,6 +97,9 @@ class MemoryCCT(nn.Module):
         x = self.tokenizer(x)
         return self.classifier.extract_memory_embedding(x)
 
+    def block_weights(self):
+        self.tokenizer.requires_grad_(False)
+
 
 class TransformerMemoryClassifier(Module):
     def __init__(self,

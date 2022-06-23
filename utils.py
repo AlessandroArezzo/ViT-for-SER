@@ -113,7 +113,7 @@ def get_gender_class_to_idx():
     return class_to_idx
 
 def get_corpus_class_to_idx():
-    class_to_idx = {"emovo": 0, "iemocap": 1, "ravdess": 2, "savee": 3, "emodb": 4}
+    class_to_idx = {"emovo": 0, "iemocap": 1, "ravdess": 2, "savee": 3, "emodb": 4, 'demos':5 }
     return class_to_idx
 
 def get_class_labels(train_dataset_path):
@@ -126,7 +126,7 @@ def get_class_labels(train_dataset_path):
                 for idx, row in enumerate(csvreader):
                     if idx > 0:
                         current_class = row[1]
-                        if current_class not in classes_label:
+                        if current_class not in classes_label and current_class != "class":
                             classes_label.append(current_class)
     return classes_label
 
@@ -155,7 +155,8 @@ def get_classes_name_from_path(path):
     return None
 
 def get_aug_type_from_path(path):
-    all_aug = ["no_aug", "balanced_aug", "time_aug", "freq_aug", "time_freq_aud"]
+    all_aug = ["no_aug", "balanced_aug", "undersampling", "undersampling_balanced", "undersampling_aug",
+               "undersampling_aug_balanced", "time_aug", "freq_aug", "time_freq_aug"]
     path_tails = path.split('/')
     for aug in all_aug:
         if aug in path_tails:
@@ -163,7 +164,8 @@ def get_aug_type_from_path(path):
     return None
 
 def get_exp_type_from_path(path):
-    all_exp = ["within-corpus", "IEMOCAP_train", "cross-corpus", "cross-corpus-demos"]
+    all_exp = ["within-corpus", "IEMOCAP_train", "cross-corpus", "cross-corpus-demos", "cross-corpus-men",
+               "cross-corpus-women"]
     path_tails = path.split('/')
     for exp in all_exp:
         if exp in path_tails:

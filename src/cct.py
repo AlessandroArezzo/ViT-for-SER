@@ -86,6 +86,14 @@ class CCT(nn.Module):
         x = self.tokenizer(x)
         return self.classifier(x)
 
+    def extract_embedding(self, x):
+        x = self.tokenizer(x)
+        return self.classifier.extract_embedding(x)
+
+
+    def block_weights(self):
+        self.tokenizer.requires_grad_(False)
+
 
 def _cct(arch, pretrained, progress,
          num_layers, num_heads, mlp_ratio, embedding_dim,
